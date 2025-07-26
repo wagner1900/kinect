@@ -1,0 +1,161 @@
+"""
+Motion capture estilo Kinect
+---------------------------------
+• Webcam (MediaPipe Pose) ou RealSense/AzureKinect
+• Suavização OneEuroFilter p/ precisão
+• Grava joints em CSV com timestamp
+"""
+
+import csv, time, pathlib, sys
+from collections import deque
+import cv2
+import numpy as np
+import mediapipe as mp
+
+# ---------- CONFIGURÁVEIS ----------
+SAVE_DIR = pathlib.Path("recordings")
+FPS_TARGET = 30                       # limite de fps
+SMOOTH_FACTOR = 0.006                 # menor = mais suave
+WEBCAM_ID = 0                         # mude se tiver >1 câmera
+# -----------------------------------
+
+mp_pose = mp.solutions.pose.Pose(
+    static_image_mode=False,
+    model_complexity=2,
+    enable_segmentation=False,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7,
+    smooth_landmarks=False)  # suavizaremos manualmente
+
+# --- OneEuroFilter para suavizar coordenadas ---
+class OneEuroFilter:
+    def __init__(self, freq, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
+        self.freq = freq
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.last_time = None
+        self.x_prev = None
+        self.dx_prev = None
+
+    def alpha(self, cutoff):
+        te = 1.0 / self.freq
+        tau = 1.0 / (2 * np.pi * cutoff)
+        return 1.0 / (1.0 + tau / te)
+
+    def filter(self, x):
+        now = time.time()
+        if self.last_time is None:
+            self.last_time = now
+        self.freq = 1.0 / (now - self.last_time)
+        self.last_time = now
+
+        if self.x_prev is None:
+            self.x_prev = x
+            self.dx_prev = 0.0 * x
+            return x
+
+        # Derivada do sinal
+        dx = (x - self.x_prev) * self.freq
+        a_d = self.alpha(self.d_cutoff)
+        dx_hat = a_d * dx + (1 - a_d) * self.dx_prev
+
+        # Cutoff adaptativo
+        cutoff = self.min_cutoff + self.beta * np.abs(dx_hat)
+        a = self.alpha(cutoff)
+        x_hat = a * x + (1 - a) * self.x_prev
+
+        self.x_prev = x_hat
+        self.dx_prev = dx_hat
+        return x_hat
+
+# Instancia filtros para 33 joints (Webcam) → 99 valores (x,y,z)
+filters = [OneEuroFilter(FPS_TARGET, SMOOTH_FACTOR, beta=0.3) for _ in range(99)]
+
+def smooth_landmarks(landmarks):
+    flat = []
+    for lm in landmarks:
+        flat.extend([lm.x, lm.y, lm.z])
+    # Aplica filtro a cada valor
+    for i, val in enumerate(flat):
+        flat[i] = filters[i].filter(val)
+    # Remonta lista de objetos NormalizedLandmark
+    it = iter(flat)
+    out = []
+    for lm in landmarks:
+        nx, ny, nz = next(it), next(it), next(it)
+        lm.x, lm.y, lm.z = nx, ny, nz
+        out.append(lm)
+    return out
+
+# ---------- CAPTURE LOOP ----------
+def capture(use_realsense=False, use_azure=False):
+    if use_realsense:
+        import pyrealsense2 as rs
+        pipeline = rs.pipeline()
+        cfg = pipeline.start()
+        align_to = rs.stream.color
+        align = rs.align(align_to)
+    elif use_azure:
+        from pyk4a import PyK4A, Config, ImageFormat
+        k4a = PyK4A(Config(color_resolution=720, depth_mode=True))
+        k4a.start()
+    else:
+        cap = cv2.VideoCapture(WEBCAM_ID)
+
+    SAVE_DIR.mkdir(exist_ok=True)
+    fname = SAVE_DIR / time.strftime("%Y-%m-%d-%H-%M-%S.csv")
+    csv_file = open(fname, "w", newline="")
+    writer = csv.writer(csv_file)
+    header = ["timestamp_ms"]
+    header += [f"{n}_{axis}" for n in range(33) for axis in ("x","y","z","vis")]
+    writer.writerow(header)
+
+    print(f"[INFO] Gravando em {fname.resolve()}")
+    try:
+        while True:
+            if use_realsense:
+                frames = pipeline.wait_for_frames()
+                frames = align.process(frames)
+                frame = np.asanyarray(frames.get_color_frame().get_data())
+            elif use_azure:
+                capture_data = k4a.get_capture()
+                frame = capture_data.color
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = mp_pose.process(frame_rgb)
+
+            if results.pose_world_landmarks:
+                lms = results.pose_world_landmarks.landmark
+                lms = smooth_landmarks(lms)
+                row = [int(time.time()*1000)]
+                for lm in lms:
+                    row.extend([lm.x, lm.y, lm.z, lm.visibility])
+                writer.writerow(row)
+
+            # Preview opcional
+            if results.pose_landmarks:
+                mp.solutions.drawing_utils.draw_landmarks(
+                    frame, results.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
+            cv2.imshow("Pose", frame)
+            if cv2.waitKey(1) & 0xFF == 27:  # ESC para sair
+                break
+    finally:
+        csv_file.close()
+        if use_realsense:
+            pipeline.stop()
+        elif use_azure:
+            k4a.stop()
+        else:
+            cap.release()
+        cv2.destroyAllWindows()
+
+# ---------- MÓDULO DE TESTE ----------
+if __name__ == "__main__":
+    arg = sys.argv[1:]  # ex: python motion_capture.py realsense
+    capture(use_realsense="realsense" in arg,
+            use_azure="azure" in arg)
