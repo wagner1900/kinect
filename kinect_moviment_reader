@@ -50,14 +50,17 @@ class OneEuroFilter:
     def filter(self, x):
         now = time.time()
         if self.last_time is None:
+            # Primeira amostra: inicializa estado e retorna valor bruto
             self.last_time = now
-        self.freq = 1.0 / (now - self.last_time)
-        self.last_time = now
-
-        if self.x_prev is None:
             self.x_prev = x
             self.dx_prev = 0.0 * x
             return x
+
+        dt = now - self.last_time
+        if dt <= 0:
+            dt = 1e-6  # evita divisão por zero ou negativa
+        self.freq = 1.0 / dt
+        self.last_time = now
 
         # Derivada do sinal
         dx = (x - self.x_prev) * self.freq
